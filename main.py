@@ -173,8 +173,8 @@ async def analyze_photo(request: AnalyzeRequest):
                 raw = raw[4:]
         parsed = json.loads(raw)
         item_data.update({
-            "brand": parsed.get("brand", ""),
-            "description": parsed.get("description", ""),
+            "brand": parsed.get("brand", "").title(),
+            "description": parsed.get("description", "").title(),
             "size": parsed.get("size", ""),
             "gender": parsed.get("gender", "neutral")
         })
@@ -221,7 +221,7 @@ async def analyze_photo(request: AnalyzeRequest):
 
                 # Label data overrides item photo data (more reliable)
                 if label_data.get("brand"):
-                    item_data["brand"] = label_data["brand"]
+                    item_data["brand"] = label_data["brand"].title()
                 if label_data.get("size"):
                     item_data["size"] = label_data["size"]
 
