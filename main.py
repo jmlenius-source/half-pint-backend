@@ -147,10 +147,10 @@ async def analyze_photo(request: AnalyzeRequest):
                                 "This is a children's clothing item for a consignment sale. "
                                 "Look at the item and respond ONLY with a JSON object (no markdown, no explanation) with these keys:\n"
                                 "- brand: brand name if visible on item, otherwise empty string\n"
-                                "- description: brief item description like 'floral dress', 'striped t-shirt', 'cargo pants' (2-3 words max)\n"
+                                "- description: concise description with primary color/pattern + any visible brand text/logos on the item + item type (e.g. 'grey Nike sweatpants', 'pink floral dress', 'blue striped polo'). Keep it 2-4 words.\n"
                                 "- size: size if visible on item tag/label (e.g. '4T', '2T', 'XS', '6-12m'), otherwise empty string\n"
                                 "- gender: 'boy', 'girl', or 'neutral' based on the item's style\n"
-                                "Example: {\"brand\": \"Carter's\", \"description\": \"floral dress\", \"size\": \"4T\", \"gender\": \"girl\"}"
+                                "Examples: {\"brand\": \"Nike\", \"description\": \"grey Nike sweatpants\", \"size\": \"12-13 YRS\", \"gender\": \"neutral\"}, {\"brand\": \"Carter's\", \"description\": \"pink floral dress\", \"size\": \"4T\", \"gender\": \"girl\"}"
                             )
                         },
                         {
