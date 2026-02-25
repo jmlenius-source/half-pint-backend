@@ -71,7 +71,7 @@ class CodeValidationRequest(BaseModel):
 class AnalyzeRequest(BaseModel):
     code: str
     image1: str  # base64 JPEG — item photo
-    image2: str  # base64 JPEG — label photo
+    image2: Optional[str] = None  # base64 JPEG — label photo
 
 # --- Endpoints ---
 
@@ -187,6 +187,8 @@ async def analyze_photo(request: AnalyzeRequest):
         vision_client = get_vision_client()
         if vision_client:
             from google.cloud import vision as gvision
+            if not request.image2:
+                raise Exception("No label photo provided")
             image_bytes = base64.b64decode(request.image2)
             image = gvision.Image(content=image_bytes)
             result = vision_client.text_detection(image=image)
