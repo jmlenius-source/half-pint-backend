@@ -229,10 +229,15 @@ ACCESS_CODES = initialize_codes()
 class CodeValidationRequest(BaseModel):
     code: str
 
+class ValidateRequest(BaseModel):
+    code: str
+    device_id: Optional[str] = None
+
 class AnalyzeRequest(BaseModel):
     code: str
     image1: str  # base64 JPEG — item photo
     image2: Optional[str] = None  # base64 JPEG — label photo
+    device_id: Optional[str] = None
 
 # --- Endpoints ---
 
@@ -253,7 +258,7 @@ async def health():
     return {"status": "ok"}
 
 @app.post("/validate-code")
-async def validate_code(request: CodeValidationRequest):
+async def validate_code(request: ValidateRequest):
     """Validate an access code and return remaining uses."""
     code = request.code.strip().upper()
 
