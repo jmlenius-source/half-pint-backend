@@ -145,12 +145,28 @@ FREE_PERIOD_START = os.environ.get("FREE_PERIOD_START", "").strip()
 FREE_PERIOD_END = os.environ.get("FREE_PERIOD_END", "").strip()
 
 # AI photo analysis costs real money on every call (OpenAI + Google Vision),
-# unlike manual and voice tagging which cost nothing per item. So the free
+# unlike typed and dictated tagging which cost nothing per item. So the free
 # period covers AI photos ONLY if you opt in:
 #   FREE_PERIOD_INCLUDES_AI=true
-# Default is false: during a free window, manual/voice tagging is open to all,
-# but AI photo auto-fill still requires a code and still deducts a use.
+# Default is false: during a free window, typed and dictated tagging is open to
+# all, but AI photo auto-fill still requires a code and still deducts a use.
 FREE_PERIOD_INCLUDES_AI = os.environ.get("FREE_PERIOD_INCLUDES_AI", "false").strip().lower() in ("1", "true", "yes")
+
+# --- Entry method pricing ---
+# The app offers three ways to tag an item:
+#   Manual Entry       typing only. ALWAYS free, no code, no deduction. The app
+#                      does not even call /consume for these.
+#   Dictation Tagging  speak the fields. Free when DICTATION_FREE is on,
+#                      otherwise needs a code and deducts one use per item.
+#   AI Auto-Fill       two photos. Always needs a code and deducts one use,
+#                      unless a free period has FREE_PERIOD_INCLUDES_AI on.
+#
+# DICTATION_FREE is a standing switch, independent of the free period, so
+# dictation can be opened up without also opening up AI photos:
+#   DICTATION_FREE=true
+# Default is false. Flipping it to true makes dictation completely open — no
+# code required and nothing deducted, for everyone.
+DICTATION_FREE = os.environ.get("DICTATION_FREE", "false").strip().lower() in ("1", "true", "yes")
 
 
 def _parse_date(value: str):
@@ -404,6 +420,8 @@ class ConsumeRequest(BaseModel):
     code: Optional[str] = ""          # may be empty during a free period
     item_id: str                      # unique per tagged item; makes edits free
     device_id: Optional[str] = None
+    mode: Optional[str] = None        # "manual" | "dictation" | "ai"; older app
+                                      # versions omit it, which is treated as "ai"
 
 class AnalyzeRequest(BaseModel):
     code: str
@@ -462,6 +480,7 @@ async def status():
         "free_start": fp["start"],
         "free_end": fp["end"],
         "free_includes_ai": FREE_PERIOD_INCLUDES_AI,
+        "dictation_free": DICTATION_FREE,
         "database": bool(db_pool),
     }
 
@@ -486,16 +505,45 @@ async def validate_code(request: ValidateRequest):
 @app.post("/consume")
 async def consume(request: ConsumeRequest):
     """
-    Deduct one use for a newly created tag (manual, voice, or photo).
+    Deduct one use for a newly created tag.
 
     Charging is keyed on item_id, so editing an existing item costs nothing and
     a retried request can never double-charge.
+
+    Free entry methods never reach this endpoint from a current app version —
+    the checks below are a backstop against a stale cached copy of the app.
     """
     code = (request.code or "").strip().upper()
     item_id = (request.item_id or "").strip()
+    mode = (request.mode or "").strip().lower()
 
     if not item_id:
         raise HTTPException(status_code=400, detail="item_id is required.")
+
+    # --- Always-free entry methods: manual typing, and dictation when it is
+    # switched on as free. Recorded at zero cost so a later edit stays free. ---
+    if mode == "manual" or (mode == "dictation" and DICTATION_FREE):
+        free_code = code if code else "FREE-MODE"
+        if db_pool:
+            with db_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO consumed_items (code, item_id)
+                        VALUES (%s, %s)
+                        ON CONFLICT (code, item_id) DO NOTHING
+                        """,
+                        (free_code, item_id),
+                    )
+                conn.commit()
+        status = code_status(code) if code else None
+        return {
+            "ok": True,
+            "charged": False,
+            "free_mode": mode,
+            "uses_remaining": status["remaining"] if status else None,
+            "total_uses": status["total"] if status else None,
+        }
 
     # --- Free period: tagging is open to everyone, nothing is deducted ---
     # The item is still recorded as charged (at zero cost) so that editing it
