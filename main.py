@@ -436,11 +436,29 @@ class AnalyzeRequest(BaseModel):
     item_id: Optional[str] = None
 
 
+def is_code_revoked(code: str) -> bool:
+    """True if this code was turned off because its Square sale was refunded."""
+    if not db_pool:
+        return False
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status FROM code_inventory WHERE code = %s", (code,))
+                row = cur.fetchone()
+        return bool(row and row[0] == "revoked")
+    except Exception as e:
+        # The inventory table may not exist yet on a brand-new database.
+        print(f"!! is_code_revoked check failed: {e}")
+        return False
+
+
 def code_status(code: str):
     """Look up a code's definition and current remaining uses."""
     entry = ACCESS_CODES.get(code)
     if not entry:
         return None
+    if is_code_revoked(code):
+        return None  # turned off after a refund: invalid everywhere in the app
     total = entry.get("total_uses", 10)
     used = get_used(code)
     return {
@@ -873,11 +891,13 @@ def build_code_email(codes: list) -> tuple:
         f"Your {code_word}:\n" + "\n".join(lines_text) + "\n\n"
         f"How to use it:\n"
         f"1. Open EasyTag in Safari or Chrome: {APP_URL}\n"
-        f"   It won't work inside Facebook, Google or other in-app browsers.\n"
-        f"   On a phone, add it to your home screen so your tagged items stay saved.\n"
-        f"2. Tap Dictation or AI Auto-Fill. When the app asks for an access code, enter the code above.\n\n"
-        f"Each item tagged with Dictation or AI Auto-Fill uses one tag. Manual Entry is always free, "
-        f"and editing an item you've already tagged doesn't use another tag.\n\n"
+        f"   It won't work inside Facebook, Google or other in-app browsers.\n\n"
+        f"2. Add it to your home screen. It then opens just like an app, and your tagged items stay saved.\n"
+        f"   - iPhone (Safari): tap the Share button (the square with an arrow), then Add to Home Screen.\n"
+        f"   - Android (Chrome): tap the menu (three dots), then Add to Home screen or Install app.\n"
+        f"   From then on, open EasyTag from that home screen icon.\n\n"
+        f"3. Tap Dictation or AI Auto-Fill. When the app asks for an access code, enter the code above.\n\n"
+        f"Each item tagged with Dictation or AI Auto-Fill uses one tag. Manual Entry is always free.\n\n"
         f"Questions? Just reply to this email.\n\n"
         f"Half-Pint Resale\n"
     )
@@ -888,13 +908,16 @@ def build_code_email(codes: list) -> tuple:
         f"<p>Your {code_word}:</p>"
         f'<table style="border-collapse:collapse;margin:0 0 16px">{"".join(lines_html)}</table>'
         "<p><b>How to use it</b></p><ol>"
-        f'<li>Open EasyTag in Safari or Chrome: <a href="{url}">{url}</a><br>'
-        "It won't work inside Facebook, Google or other in-app browsers. "
-        "On a phone, add it to your home screen so your tagged items stay saved.</li>"
+        f'<li style="margin-bottom:10px">Open EasyTag in <b>Safari or Chrome</b>: <a href="{url}">{url}</a><br>'
+        "It won't work inside Facebook, Google or other in-app browsers.</li>"
+        '<li style="margin-bottom:10px"><b>Add it to your home screen.</b> It then opens just like an app, '
+        "and your tagged items stay saved.<br>"
+        "&bull; <b>iPhone (Safari):</b> tap the Share button (the square with an arrow), then <b>Add to Home Screen</b>.<br>"
+        "&bull; <b>Android (Chrome):</b> tap the menu (three dots), then <b>Add to Home screen</b> or <b>Install app</b>.<br>"
+        "From then on, open EasyTag from that home screen icon.</li>"
         "<li>Tap <b>Dictation</b> or <b>AI Auto-Fill</b>. When the app asks for an access code, enter the code above.</li>"
         "</ol>"
-        "<p>Each item tagged with Dictation or AI Auto-Fill uses one tag. Manual Entry is always free, "
-        "and editing an item you've already tagged doesn't use another tag.</p>"
+        "<p>Each item tagged with Dictation or AI Auto-Fill uses one tag. Manual Entry is always free.</p>"
         "<p>Questions? Just reply to this email.</p>"
         "<p>Half-Pint Resale</p></div>"
     )
@@ -921,6 +944,71 @@ def _is_refunded(payment: dict) -> bool:
     return int(((payment.get("refunded_money") or {}).get("amount")) or 0) > 0
 
 
+def revoke_codes_for_payment(payment_id: str) -> list:
+    """Turn off every code this payment received. Returns only newly turned-off codes."""
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            lock_inventory(cur)
+            cur.execute(
+                """
+                UPDATE code_inventory
+                   SET status = 'revoked',
+                       note = TRIM(COALESCE(note, '') || ' turned off after refund ' || TO_CHAR(NOW(), 'YYYY-MM-DD'))
+                 WHERE payment_id = %s AND status = 'sold'
+                RETURNING code
+                """,
+                (payment_id,),
+            )
+            codes = [r[0] for r in cur.fetchall()]
+        conn.commit()
+    return codes
+
+
+async def handle_refund(payment: dict) -> dict:
+    """
+    A fully refunded sale loses its codes. A partial refund only alerts the owner,
+    since it may be just part of a multi-code order.
+    """
+    payment_id = payment.get("id")
+    refunded = int(((payment.get("refunded_money") or {}).get("amount")) or 0)
+    paid = int(((payment.get("total_money") or payment.get("amount_money") or {}).get("amount")) or 0)
+
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT code FROM code_inventory WHERE payment_id = %s AND status = 'sold' ORDER BY code",
+                (payment_id,),
+            )
+            active = [r[0] for r in cur.fetchall()]
+    if not active:
+        return {"ok": True, "skipped": "refunded payment has no active codes"}
+
+    if paid and refunded < paid:
+        error = "Partial refund: codes still active"
+        prev = get_square_order(payment_id)
+        if not prev or prev["last_error"] != error:
+            await alert_owner(
+                "Partial refund: codes still active",
+                f"Square payment {payment_id} was partly refunded "
+                f"(${refunded / 100:.2f} of ${paid / 100:.2f}).\n"
+                f"These codes are still working: {', '.join(active)}\n\n"
+                f"Nothing was turned off automatically. If you want a code turned off, "
+                f"refund the full payment.",
+            )
+            record_square_order(payment_id, payment.get("order_id"), None, error=error)
+        return {"ok": True, "partial_refund": True, "codes_still_active": active}
+
+    revoked = revoke_codes_for_payment(payment_id)
+    if revoked:
+        await alert_owner(
+            "Refund: code turned off",
+            f"Square payment {payment_id} was fully refunded, so these codes no longer "
+            f"work in the app: {', '.join(revoked)}",
+        )
+        record_square_order(payment_id, payment.get("order_id"), None, error="Refunded: codes turned off")
+    return {"ok": True, "refunded": True, "codes_turned_off": revoked}
+
+
 async def fulfill_payment(payment: dict, email_override: Optional[str] = None,
                           force_resend: bool = False, from_webhook: bool = False) -> dict:
     """
@@ -937,7 +1025,7 @@ async def fulfill_payment(payment: dict, email_override: Optional[str] = None,
     if not order_id:
         return {"ok": True, "skipped": "payment has no order"}
     if _is_refunded(payment):
-        return {"ok": True, "skipped": "payment was refunded"}
+        return await handle_refund(payment)
     if from_webhook:
         age = _payment_age_hours(payment)
         if age is not None and age > FRESH_PAYMENT_HOURS:
@@ -1442,13 +1530,15 @@ async def admin_code_sales(request: Request):
                 t = inventory.setdefault(code_type, {"available": 0, "sold": {}})
                 if status == "available":
                     t["available"] += n
+                elif status == "revoked":
+                    t["turned_off_after_refund"] = t.get("turned_off_after_refund", 0) + n
                 else:
                     t["sold"][source or "other"] = n
 
             cur.execute("""
                 SELECT o.payment_id, o.order_id, o.buyer_email, o.email_sent_at,
                        o.last_error, o.created_at,
-                       COALESCE(string_agg(i.code, ', ' ORDER BY i.code), '')
+                       COALESCE(string_agg(i.code || CASE WHEN i.status = 'revoked' THEN ' (turned off)' ELSE '' END, ', ' ORDER BY i.code), '')
                   FROM square_orders o
                   LEFT JOIN code_inventory i ON i.payment_id = o.payment_id
                  GROUP BY o.payment_id
