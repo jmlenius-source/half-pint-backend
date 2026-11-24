@@ -1,10 +1,15 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 import os
 import base64
 import json
+import hmac
+import re
+import hashlib
+import html as html_lib
+import httpx  # already installed as part of the openai package
 from typing import Optional
 from datetime import datetime, timezone
 
@@ -446,16 +451,629 @@ def code_status(code: str):
     }
 
 
+# =============================================================================
+# Square -> automatic code delivery
+# =============================================================================
+# When someone buys EasyTag tags through Square, Square calls /square-webhook.
+# We confirm the call really came from Square, look up what was bought, hand out
+# unsold codes from the inventory, and email them to the buyer through Resend.
+# (Railway's Hobby plan blocks ordinary SMTP email, so an HTTPS email service is
+# required.)
+#
+# Railway variables:
+#   SQUARE_ACCESS_TOKEN           Square Developer Console -> your app -> Credentials
+#   SQUARE_WEBHOOK_SIGNATURE_KEY  Square Developer Console -> Webhooks -> your subscription
+#   SQUARE_WEBHOOK_URL            the EXACT notification URL entered in Square, e.g.
+#                                 https://<your-railway-app>.up.railway.app/square-webhook
+#   SQUARE_ENVIRONMENT            "production" (default) or "sandbox"
+#   SQUARE_CODE_ITEMS             which Square item(s) count as buying an EasyTag
+#                                 code (200 tags), e.g.  EasyTag Code
+#   SQUARE_TRIAL_ITEMS            optional: Square item(s) that sell a Trial code.
+#                                 Leave unset if trials are only given by hand.
+#                                 Both are comma-separated; each entry may be the item
+#                                 name, "Item: Variation", or a variation ID.
+#                                 Not case-sensitive.
+#   RESEND_API_KEY                resend.com -> API Keys
+#   EMAIL_FROM                    e.g.  Half-Pint Resale <easytag@yourdomain.com>
+#                                 (the domain must be verified in Resend)
+#   OWNER_EMAIL                   optional: gets a copy of every code email, receives
+#                                 buyer replies, and gets an alert if a sale can't
+#                                 be fulfilled automatically
+#   ADMIN_KEY                     optional: password for the /admin pages below
+#   PRESOLD_CODES                 optional: codes already handed out by hand, comma-
+#                                 separated, so they are never sold a second time
+#   APP_URL                       optional, defaults to the live Netlify site
+
+def _env_set(name: str) -> set:
+    return {p.strip().lower() for p in os.environ.get(name, "").split(",") if p.strip()}
+
+SQUARE_ACCESS_TOKEN = os.environ.get("SQUARE_ACCESS_TOKEN", "").strip()
+SQUARE_WEBHOOK_SIGNATURE_KEY = os.environ.get("SQUARE_WEBHOOK_SIGNATURE_KEY", "").strip()
+SQUARE_WEBHOOK_URL = os.environ.get("SQUARE_WEBHOOK_URL", "").strip()
+SQUARE_ENVIRONMENT = os.environ.get("SQUARE_ENVIRONMENT", "production").strip().lower()
+SQUARE_API_BASE = (
+    "https://connect.squareupsandbox.com" if SQUARE_ENVIRONMENT == "sandbox"
+    else "https://connect.squareup.com"
+)
+# Optional. When unset, Square uses the API version selected for your app.
+SQUARE_API_VERSION = os.environ.get("SQUARE_API_VERSION", "").strip()
+SQUARE_TRIAL_ITEMS = _env_set("SQUARE_TRIAL_ITEMS")
+# The paid 200-tag codes are the "season" type internally (SS- prefix).
+# SQUARE_SEASON_ITEMS is the older name for SQUARE_CODE_ITEMS and still works.
+SQUARE_SEASON_ITEMS = _env_set("SQUARE_CODE_ITEMS") | _env_set("SQUARE_SEASON_ITEMS")
+
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "").strip()
+OWNER_EMAIL = os.environ.get("OWNER_EMAIL", "").strip()
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "").strip()
+APP_URL = os.environ.get("APP_URL", "https://half-pint-easytag.netlify.app").strip()
+PRESOLD_CODES = [
+    c.strip().upper()
+    for c in os.environ.get("PRESOLD_CODES", "").replace("\n", ",").replace(" ", ",").split(",")
+    if c.strip()
+]
+
+# What buyers and the admin pages see. Internally the paid codes are type "season".
+CODE_LABELS = {"trial": "Trial code", "season": "EasyTag code"}
+
+
+# Every change to code_inventory takes this one database lock first, so changes
+# happen one at a time and can never deadlock each other (e.g. a sale arriving
+# while a redeploying server runs its startup cleanup). Sales are rare enough
+# that waiting a moment costs nothing.
+INVENTORY_LOCK_ID = 7246010
+
+
+def lock_inventory(cur):
+    """Hold the inventory lock until the current transaction commits."""
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (INVENTORY_LOCK_ID,))
+
+
+def init_code_sales_tables():
+    """
+    Create the inventory/sales tables and load every sellable code into the
+    inventory. Safe to run on every startup: existing rows are never changed,
+    except that codes known to be in someone's hands are marked sold.
+    """
+    if not db_pool:
+        return
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            # Take the inventory lock before touching the tables at all, so a
+            # second server starting during a redeploy simply waits its turn.
+            lock_inventory(cur)
+
+            # One row per sellable code. status: available | sold
+            # source says how it left inventory: square | manual | in-use
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS code_inventory (
+                    code TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'available',
+                    source TEXT,
+                    payment_id TEXT,
+                    buyer_email TEXT,
+                    assigned_at TIMESTAMPTZ
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS code_inventory_payment_idx ON code_inventory (payment_id)")
+            # Who a hand-given code went to (from the /admin/give-code page).
+            cur.execute("ALTER TABLE code_inventory ADD COLUMN IF NOT EXISTS note TEXT")
+            # One row per Square payment that bought EasyTag codes.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS square_orders (
+                    payment_id TEXT PRIMARY KEY,
+                    order_id TEXT,
+                    buyer_email TEXT,
+                    email_sent_at TIMESTAMPTZ,
+                    last_error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            # Load the code list. seq keeps the list order so sales hand out codes
+            # from the END of each list, away from any handed out by hand from the top.
+            rows = [
+                (code, meta["type"], i)
+                for i, (code, meta) in enumerate(ACCESS_CODES.items())
+                if code not in TEST_CODES
+            ]
+            cur.executemany(
+                "INSERT INTO code_inventory (code, type, seq) VALUES (%s, %s, %s) "
+                "ON CONFLICT (code) DO NOTHING",
+                rows,
+            )
+
+            # Any code that has ever been used in the app is clearly in someone's hands.
+            cur.execute("""
+                UPDATE code_inventory
+                   SET status = 'sold', source = 'in-use', assigned_at = NOW()
+                 WHERE status = 'available'
+                   AND (code IN (SELECT code FROM code_usage)
+                        OR code IN (SELECT code FROM consumed_items))
+            """)
+
+            # Codes handed out by hand, listed in the PRESOLD_CODES variable.
+            if PRESOLD_CODES:
+                cur.execute(
+                    """
+                    UPDATE code_inventory
+                       SET status = 'sold', source = 'manual', assigned_at = NOW()
+                     WHERE status = 'available' AND code = ANY(%s)
+                    """,
+                    (PRESOLD_CODES,),
+                )
+        conn.commit()
+    print("✓ Code inventory ready")
+
+
+def mark_code_in_use(code: str):
+    """A code just showed up in the app, so it must never be sold to anyone else."""
+    if not db_pool:
+        return
+    try:
+        with db_pool.connection() as conn:
+            with conn.cursor() as cur:
+                lock_inventory(cur)
+                cur.execute(
+                    """
+                    UPDATE code_inventory
+                       SET status = 'sold', source = 'in-use', assigned_at = NOW()
+                     WHERE code = %s AND status = 'available'
+                    """,
+                    (code,),
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"!! mark_code_in_use error: {e}")
+
+
+def verify_square_signature(raw_body: bytes, signature: str) -> bool:
+    """
+    Square signs each webhook with HMAC-SHA256 over (notification URL + raw body),
+    base64-encoded, in the x-square-hmacsha256-signature header.
+    """
+    if not (SQUARE_WEBHOOK_SIGNATURE_KEY and SQUARE_WEBHOOK_URL and signature):
+        return False
+    digest = hmac.new(
+        SQUARE_WEBHOOK_SIGNATURE_KEY.encode("utf-8"),
+        SQUARE_WEBHOOK_URL.encode("utf-8") + raw_body,
+        hashlib.sha256,
+    ).digest()
+    expected = base64.b64encode(digest).decode("ascii")
+    return hmac.compare_digest(expected, signature)
+
+
+async def square_get(path: str):
+    """GET from the Square API. Returns parsed JSON, or None on 404."""
+    headers = {
+        "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
+        "Accept": "application/json",
+    }
+    if SQUARE_API_VERSION:
+        headers["Square-Version"] = SQUARE_API_VERSION
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(SQUARE_API_BASE + path, headers=headers)
+    if r.status_code == 404:
+        return None
+    if r.status_code >= 300:
+        raise RuntimeError(f"Square API {r.status_code} on {path}: {r.text[:300]}")
+    return r.json()
+
+
+def count_codes_in_order(order: dict) -> dict:
+    """How many Trial and EasyTag (season-type) codes this Square order paid for."""
+    counts = {"trial": 0, "season": 0}
+    for li in order.get("line_items") or []:
+        name = (li.get("name") or "").strip().lower()
+        variation = (li.get("variation_name") or "").strip().lower()
+        keys = {
+            (li.get("catalog_object_id") or "").strip().lower(),
+            name,
+            f"{name}: {variation}" if variation else "",
+        }
+        keys.discard("")
+        try:
+            qty = max(0, int(float(li.get("quantity") or "1")))
+        except (TypeError, ValueError):
+            qty = 1
+        if keys & SQUARE_TRIAL_ITEMS:
+            counts["trial"] += qty
+        elif keys & SQUARE_SEASON_ITEMS:
+            counts["season"] += qty
+    return counts
+
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+'-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+async def find_buyer_email(payment: dict, order: dict) -> Optional[str]:
+    """
+    Square doesn't always put the buyer's email on the payment, so check, in order:
+    the payment, the order's fulfillment recipient, then the customer record.
+    """
+    email = (payment.get("buyer_email_address") or "").strip()
+    if email:
+        return email
+
+    for f in order.get("fulfillments") or []:
+        for key in ("shipment_details", "pickup_details", "delivery_details", "digital_details"):
+            recipient = (f.get(key) or {}).get("recipient") or {}
+            email = (recipient.get("email_address") or "").strip()
+            if email:
+                return email
+
+    # The Half-Pint payment link asks buyers to type their email into a box, which
+    # Square stores as a note on the line item ("Email Address: someone@x.com").
+    notes = [li.get("note") or "" for li in order.get("line_items") or []]
+    notes.append(order.get("note") or "")
+    for note in notes:
+        m = EMAIL_RE.search(note)
+        if m:
+            return m.group(0).rstrip(".")
+
+    customer_id = payment.get("customer_id") or order.get("customer_id")
+    if customer_id:
+        try:
+            data = await square_get(f"/v2/customers/{customer_id}")
+            email = (((data or {}).get("customer") or {}).get("email_address") or "").strip()
+            if email:
+                return email
+        except Exception as e:
+            print(f"!! Square customer lookup failed: {e}")
+    return None
+
+
+class OutOfCodes(Exception):
+    pass
+
+
+def allocate_codes(payment_id: str, buyer_email: Optional[str], counts: dict) -> list:
+    """
+    Assign unsold codes to this payment, all or nothing. If this payment already
+    has codes (a repeated webhook), return those instead of assigning new ones.
+    Returns a list of (code, type).
+    """
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            # Two webhooks for the same payment arriving at once wait for each other here.
+            lock_inventory(cur)
+            cur.execute(
+                "SELECT code, type FROM code_inventory WHERE payment_id = %s ORDER BY type DESC, code",
+                (payment_id,),
+            )
+            existing = cur.fetchall()
+            if existing:
+                conn.commit()
+                return [(c, t) for c, t in existing]
+
+            assigned = []
+            for code_type in ("trial", "season"):
+                qty = counts.get(code_type, 0)
+                if qty <= 0:
+                    continue
+                cur.execute(
+                    """
+                    UPDATE code_inventory
+                       SET status = 'sold', source = 'square', payment_id = %s,
+                           buyer_email = %s, assigned_at = NOW()
+                     WHERE code IN (
+                           SELECT code FROM code_inventory
+                            WHERE type = %s AND status = 'available'
+                            ORDER BY seq DESC
+                            LIMIT %s
+                              FOR UPDATE SKIP LOCKED)
+                    RETURNING code, type
+                    """,
+                    (payment_id, buyer_email, code_type, qty),
+                )
+                rows = cur.fetchall()
+                if len(rows) < qty:
+                    conn.rollback()
+                    raise OutOfCodes(f"needed {qty} {CODE_LABELS[code_type]}(s), only {len(rows)} left")
+                assigned.extend(rows)
+        conn.commit()
+    return assigned
+
+
+def get_square_order(payment_id: str) -> Optional[dict]:
+    if not db_pool:
+        return None
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT buyer_email, email_sent_at, last_error FROM square_orders WHERE payment_id = %s",
+                (payment_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {"buyer_email": row[0], "email_sent_at": row[1], "last_error": row[2]}
+
+
+def record_square_order(payment_id: str, order_id: Optional[str], buyer_email: Optional[str],
+                        error: Optional[str] = None, email_sent: bool = False):
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO square_orders (payment_id, order_id, buyer_email, last_error, email_sent_at)
+                VALUES (%s, %s, %s, %s, CASE WHEN %s THEN NOW() END)
+                ON CONFLICT (payment_id) DO UPDATE SET
+                    order_id = COALESCE(EXCLUDED.order_id, square_orders.order_id),
+                    buyer_email = COALESCE(EXCLUDED.buyer_email, square_orders.buyer_email),
+                    last_error = EXCLUDED.last_error,
+                    email_sent_at = CASE WHEN %s THEN NOW() ELSE square_orders.email_sent_at END,
+                    updated_at = NOW()
+                """,
+                (payment_id, order_id, buyer_email, error, email_sent, email_sent),
+            )
+            if buyer_email:
+                lock_inventory(cur)
+                cur.execute(
+                    "UPDATE code_inventory SET buyer_email = %s WHERE payment_id = %s",
+                    (buyer_email, payment_id),
+                )
+        conn.commit()
+
+
+async def send_email(to: str, subject: str, html_body: str, text_body: str,
+                     idempotency_key: Optional[str] = None, copy_owner: bool = True):
+    """Send one email through Resend's HTTPS API. Raises on failure."""
+    if not (RESEND_API_KEY and EMAIL_FROM):
+        raise RuntimeError("RESEND_API_KEY / EMAIL_FROM not set")
+    payload = {"from": EMAIL_FROM, "to": [to], "subject": subject,
+               "html": html_body, "text": text_body}
+    if OWNER_EMAIL:
+        payload["reply_to"] = OWNER_EMAIL
+        if copy_owner and OWNER_EMAIL.lower() != to.lower():
+            payload["bcc"] = [OWNER_EMAIL]
+    headers = {"Authorization": f"Bearer {RESEND_API_KEY}"}
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post("https://api.resend.com/emails", json=payload, headers=headers)
+    if r.status_code >= 300:
+        raise RuntimeError(f"Resend {r.status_code}: {r.text[:300]}")
+
+
+async def alert_owner(subject: str, message: str):
+    """Best-effort heads-up to OWNER_EMAIL. Never raises."""
+    print(f"!! {subject}: {message}")
+    if not OWNER_EMAIL:
+        return
+    try:
+        await send_email(OWNER_EMAIL, f"[EasyTag] {subject}",
+                         f"<pre>{html_lib.escape(message)}</pre>", message, copy_owner=False)
+    except Exception as e:
+        print(f"!! Owner alert failed: {e}")
+
+
+def build_code_email(codes: list) -> tuple:
+    """Returns (subject, html, text) for the buyer's code email."""
+    plural = len(codes) > 1
+    subject = "Your Half-Pint EasyTag codes" if plural else "Your Half-Pint EasyTag code"
+
+    lines_text, lines_html = [], []
+    for code, code_type in codes:
+        uses = ACCESS_CODES.get(code, {}).get("total_uses", 0)
+        label = CODE_LABELS.get(code_type, "Code")
+        lines_text.append(f"  {code}   ({label}, {uses} tags)")
+        lines_html.append(
+            f'<tr><td style="font:bold 22px monospace;letter-spacing:1px;padding:6px 16px 6px 0">'
+            f'{html_lib.escape(code)}</td>'
+            f'<td style="color:#555">{label}, {uses} tags</td></tr>'
+        )
+
+    code_word = "codes" if plural else "code"
+    text = (
+        f"Thanks for buying EasyTag tags for Half-Pint Resale!\n\n"
+        f"Your {code_word}:\n" + "\n".join(lines_text) + "\n\n"
+        f"How to use it:\n"
+        f"1. Open EasyTag in Safari or Chrome: {APP_URL}\n"
+        f"   It won't work inside Facebook, Google or other in-app browsers.\n"
+        f"   On a phone, add it to your home screen so your tagged items stay saved.\n"
+        f"2. Tap Dictation or AI Auto-Fill. When the app asks for an access code, enter the code above.\n\n"
+        f"Each item tagged with Dictation or AI Auto-Fill uses one tag. Manual Entry is always free, "
+        f"and editing an item you've already tagged doesn't use another tag.\n\n"
+        f"Questions? Just reply to this email.\n\n"
+        f"Half-Pint Resale\n"
+    )
+    url = html_lib.escape(APP_URL)
+    html_body = (
+        '<div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.5;color:#222;max-width:560px">'
+        "<p>Thanks for buying EasyTag tags for Half-Pint Resale!</p>"
+        f"<p>Your {code_word}:</p>"
+        f'<table style="border-collapse:collapse;margin:0 0 16px">{"".join(lines_html)}</table>'
+        "<p><b>How to use it</b></p><ol>"
+        f'<li>Open EasyTag in Safari or Chrome: <a href="{url}">{url}</a><br>'
+        "It won't work inside Facebook, Google or other in-app browsers. "
+        "On a phone, add it to your home screen so your tagged items stay saved.</li>"
+        "<li>Tap <b>Dictation</b> or <b>AI Auto-Fill</b>. When the app asks for an access code, enter the code above.</li>"
+        "</ol>"
+        "<p>Each item tagged with Dictation or AI Auto-Fill uses one tag. Manual Entry is always free, "
+        "and editing an item you've already tagged doesn't use another tag.</p>"
+        "<p>Questions? Just reply to this email.</p>"
+        "<p>Half-Pint Resale</p></div>"
+    )
+    return subject, html_body, text
+
+
+# A webhook for a payment older than this is an update to an old sale (a refund,
+# a note edit), not a new purchase. Square's own retries finish well inside this.
+FRESH_PAYMENT_HOURS = 72
+
+
+def _payment_age_hours(payment: dict) -> Optional[float]:
+    created = (payment.get("created_at") or "").strip()
+    if not created:
+        return None
+    try:
+        when = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - when).total_seconds() / 3600
+    except ValueError:
+        return None
+
+
+def _is_refunded(payment: dict) -> bool:
+    return int(((payment.get("refunded_money") or {}).get("amount")) or 0) > 0
+
+
+async def fulfill_payment(payment: dict, email_override: Optional[str] = None,
+                          force_resend: bool = False, from_webhook: bool = False) -> dict:
+    """
+    Turn one completed Square payment into emailed codes. Safe to call any number
+    of times for the same payment: codes are assigned once and the email is sent once
+    (unless force_resend).
+    """
+    payment_id = payment.get("id")
+    order_id = payment.get("order_id")
+    if not payment_id:
+        return {"ok": True, "skipped": "no payment id"}
+    if payment.get("status") != "COMPLETED":
+        return {"ok": True, "skipped": f"payment status {payment.get('status')}"}
+    if not order_id:
+        return {"ok": True, "skipped": "payment has no order"}
+    if _is_refunded(payment):
+        return {"ok": True, "skipped": "payment was refunded"}
+    if from_webhook:
+        age = _payment_age_hours(payment)
+        if age is not None and age > FRESH_PAYMENT_HOURS:
+            # Old sales (including ones whose codes were sent by hand before this
+            # went live) never get an automatic code. /admin/retry-payment still can.
+            return {"ok": True, "skipped": "update to an old payment"}
+
+    # Square sends payment.updated more than once per payment. Once the email has
+    # gone out, there's nothing more to do.
+    prev = get_square_order(payment_id)
+    if prev and prev["email_sent_at"] and not force_resend:
+        return {"ok": True, "already_sent": True}
+
+    order = ((await square_get(f"/v2/orders/{order_id}")) or {}).get("order")
+    if not order:
+        return {"ok": True, "skipped": "order not found"}
+
+    counts = count_codes_in_order(order)
+    if not (counts["trial"] or counts["season"]):
+        return {"ok": True, "skipped": "no EasyTag items in order"}
+
+    email = (email_override or "").strip() or await find_buyer_email(payment, order)
+
+    try:
+        codes = allocate_codes(payment_id, email, counts)
+    except OutOfCodes as e:
+        error = f"Out of codes: {e}"
+        if not prev or prev["last_error"] != error:
+            await alert_owner(
+                "Sale could not be filled: out of codes",
+                f"Square payment {payment_id} (order {order_id}) bought "
+                f"{counts['season']} EasyTag code(s) and {counts['trial']} trial code(s), "
+                f"but there aren't enough unsold codes.\nBuyer email: {email or 'unknown'}\n\n"
+                f"Add codes to main.py, redeploy, then open "
+                f"/admin/retry-payment?payment_id={payment_id}&key=YOUR_ADMIN_KEY",
+            )
+        record_square_order(payment_id, order_id, email, error=error)
+        return {"ok": False, "error": "out_of_codes", "detail": str(e)}
+
+    code_list = ", ".join(c for c, _ in codes)
+
+    if not email:
+        error = "No buyer email found on the Square payment, order or customer"
+        if not prev or prev["last_error"] != error:
+            await alert_owner(
+                "Sale needs a manual email",
+                f"Square payment {payment_id} (order {order_id}) was assigned: {code_list}\n"
+                f"but Square didn't provide the buyer's email.\n\n"
+                f"Either email the code yourself, or open\n"
+                f"/admin/retry-payment?payment_id={payment_id}&email=BUYER@EXAMPLE.COM&key=YOUR_ADMIN_KEY",
+            )
+        record_square_order(payment_id, order_id, None, error=error)
+        return {"ok": False, "error": "no_email", "codes": [c for c, _ in codes]}
+
+    subject, html_body, text_body = build_code_email(codes)
+    try:
+        await send_email(
+            email, subject, html_body, text_body,
+            # Resend drops a repeat of the same key, so a retried webhook can't
+            # double-send. A deliberate resend skips the key.
+            idempotency_key=None if force_resend else f"easytag-codes-{payment_id}",
+        )
+    except Exception as e:
+        record_square_order(payment_id, order_id, email, error=f"Email failed: {e}"[:500])
+        raise  # webhook answers 500 so Square tries again later
+
+    record_square_order(payment_id, order_id, email, error=None, email_sent=True)
+    print(f"✓ Square sale {payment_id}: sent {code_list} to {email}")
+    return {"ok": True, "sent_to": email, "codes": [c for c, _ in codes]}
+
+
+def require_admin(request: Request, form_key: Optional[str] = None):
+    key = form_key or request.headers.get("x-admin-key") or request.query_params.get("key") or ""
+    if not ADMIN_KEY or not hmac.compare_digest(key, ADMIN_KEY):
+        raise HTTPException(status_code=403, detail="Admin key required.")
+
+
+def take_code_by_hand(code_type: str, note: str, email: Optional[str]) -> Optional[str]:
+    """
+    Mark the next free code of this type as given out by hand and return it.
+    Takes from the TOP of the list; Square sales take from the bottom.
+    """
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            lock_inventory(cur)
+            cur.execute(
+                """
+                UPDATE code_inventory
+                   SET status = 'sold', source = 'manual', note = %s,
+                       buyer_email = %s, assigned_at = NOW()
+                 WHERE code = (
+                       SELECT code FROM code_inventory
+                        WHERE type = %s AND status = 'available'
+                        ORDER BY seq ASC
+                        LIMIT 1
+                          FOR UPDATE SKIP LOCKED)
+                RETURNING code
+                """,
+                (note or None, email or None, code_type),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return row[0] if row else None
+
+
+def _admin_page(title: str, body: str):
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{html_lib.escape(title)}</title>"
+        "<style>body{font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:24px auto;padding:0 16px;color:#222}"
+        "label{display:block;margin:14px 0 4px;font-weight:bold}"
+        "input,select,button{font-size:17px;padding:10px;width:100%;box-sizing:border-box}"
+        "button{margin-top:20px;background:#2a6;color:#fff;border:0;border-radius:6px}"
+        ".code{font:bold 30px monospace;letter-spacing:2px;padding:14px;background:#f3f3f3;"
+        "border-radius:6px;text-align:center;margin:12px 0;user-select:all}"
+        ".muted{color:#666;font-size:14px}.err{color:#b00}</style></head><body>"
+        f"{body}</body></html>"
+    )
+
+
 # --- Endpoints ---
 
 @app.on_event("startup")
 async def startup_event():
     init_database()
+    try:
+        init_code_sales_tables()
+    except Exception as e:
+        print(f"!! Code inventory setup error: {e}")
     print(f"✓ Loaded {len(ACCESS_CODES)} access codes")
     trial_count = sum(1 for c in ACCESS_CODES.values() if c["type"] == "trial")
     season_count = sum(1 for c in ACCESS_CODES.values() if c["type"] == "season")
     print(f"  - {trial_count} trial codes (10 uses each)")
-    print(f"  - {season_count} season codes (200 uses each)")
+    print(f"  - {season_count} EasyTag codes (200 uses each)")
     print(f"  - persistence: {'ON (database)' if db_pool else 'OFF (in-memory only!)'}")
 
 @app.get("/")
@@ -493,6 +1111,9 @@ async def validate_code(request: ValidateRequest):
     status = code_status(code)
     if not status:
         raise HTTPException(status_code=404, detail="Invalid access code. Please check and try again.")
+
+    # Someone has this code in hand, so Square sales must never hand it out again.
+    mark_code_in_use(code)
 
     return {
         "valid": True,
@@ -753,6 +1374,223 @@ async def analyze_photo(request: AnalyzeRequest):
         "gender": item_data.get("gender", "neutral"),
         "uses_remaining": new_remaining
     }
+
+
+@app.post("/square-webhook")
+async def square_webhook(request: Request):
+    """
+    Square calls this for every payment event. Only completed payments whose order
+    contains an EasyTag item do anything; everything else is acknowledged and ignored.
+    """
+    raw = await request.body()
+    signature = request.headers.get("x-square-hmacsha256-signature", "")
+    if not verify_square_signature(raw, signature):
+        print("!! Square webhook rejected: signature did not match "
+              "(check SQUARE_WEBHOOK_SIGNATURE_KEY and SQUARE_WEBHOOK_URL)")
+        raise HTTPException(status_code=403, detail="Invalid signature.")
+
+    try:
+        event = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Bad JSON.")
+
+    if event.get("type") != "payment.updated":
+        return {"ok": True, "ignored": event.get("type")}
+
+    payment = ((event.get("data") or {}).get("object") or {}).get("payment") or {}
+
+    if not db_pool:
+        # Without the database we can't track inventory; let Square retry later.
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
+    try:
+        result = await fulfill_payment(payment, from_webhook=True)
+    except Exception as e:
+        print(f"!! Square fulfillment error for payment {payment.get('id')}: {e}")
+        try:
+            if payment.get("id"):
+                record_square_order(payment["id"], payment.get("order_id"), None,
+                                    error=f"{e}"[:500])
+        except Exception:
+            pass
+        # A non-2xx answer makes Square deliver this event again later.
+        raise HTTPException(status_code=500, detail="Fulfillment failed; will retry.")
+
+    if not result.get("skipped"):
+        print(f"Square webhook {payment.get('id')}: {result}")
+    return result
+
+
+@app.get("/admin/code-sales")
+async def admin_code_sales(request: Request):
+    """
+    Inventory counts, setup check, and the 50 most recent Square sales.
+    Open in a browser:  /admin/code-sales?key=YOUR_ADMIN_KEY
+    """
+    require_admin(request)
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT type, status, COALESCE(source, ''), COUNT(*)
+                  FROM code_inventory GROUP BY 1, 2, 3 ORDER BY 1, 2, 3
+            """)
+            inventory = {}
+            for code_type, status, source, n in cur.fetchall():
+                t = inventory.setdefault(code_type, {"available": 0, "sold": {}})
+                if status == "available":
+                    t["available"] += n
+                else:
+                    t["sold"][source or "other"] = n
+
+            cur.execute("""
+                SELECT o.payment_id, o.order_id, o.buyer_email, o.email_sent_at,
+                       o.last_error, o.created_at,
+                       COALESCE(string_agg(i.code, ', ' ORDER BY i.code), '')
+                  FROM square_orders o
+                  LEFT JOIN code_inventory i ON i.payment_id = o.payment_id
+                 GROUP BY o.payment_id
+                 ORDER BY o.created_at DESC
+                 LIMIT 50
+            """)
+            sales = [
+                {
+                    "payment_id": r[0], "order_id": r[1], "buyer_email": r[2],
+                    "email_sent_at": r[3], "problem": r[4], "created_at": r[5],
+                    "codes": r[6],
+                }
+                for r in cur.fetchall()
+            ]
+
+            cur.execute("""
+                SELECT code, type, note, buyer_email, assigned_at
+                  FROM code_inventory
+                 WHERE source = 'manual' AND note IS NOT NULL
+                 ORDER BY assigned_at DESC
+                 LIMIT 50
+            """)
+            hand_given = [
+                {"code": r[0], "type": r[1], "note": r[2], "email": r[3], "given_at": r[4]}
+                for r in cur.fetchall()
+            ]
+
+    return {
+        "setup": {
+            "square_access_token": bool(SQUARE_ACCESS_TOKEN),
+            "square_signature_key": bool(SQUARE_WEBHOOK_SIGNATURE_KEY),
+            "square_webhook_url": SQUARE_WEBHOOK_URL or None,
+            "square_environment": SQUARE_ENVIRONMENT,
+            "trial_items": sorted(SQUARE_TRIAL_ITEMS),
+            "easytag_code_items": sorted(SQUARE_SEASON_ITEMS),
+            "resend_api_key": bool(RESEND_API_KEY),
+            "email_from": EMAIL_FROM or None,
+            "owner_email": OWNER_EMAIL or None,
+            "presold_codes_listed": len(PRESOLD_CODES),
+        },
+        "inventory": inventory,
+        "recent_sales": sales,
+        "recent_hand_given": hand_given,
+    }
+
+
+@app.get("/admin/give-code")
+async def admin_give_code_form(request: Request):
+    """
+    Page for handing out a code by hand (thank-yous, direct payments).
+    Bookmark:  /admin/give-code?key=YOUR_ADMIN_KEY
+    Opening the page never uses up a code; only the button does.
+    """
+    require_admin(request)
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+    with db_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT type, COUNT(*) FROM code_inventory WHERE status = 'available' GROUP BY type")
+            left = dict(cur.fetchall())
+    key = html_lib.escape(request.query_params.get("key", ""))
+    return _admin_page("Give out a code", f"""
+        <h2>Give out an EasyTag code</h2>
+        <form method="post" action="/admin/give-code" onsubmit="this.querySelector('button').disabled=true">
+          <input type="hidden" name="key" value="{key}">
+          <label>Type</label>
+          <select name="type">
+            <option value="season">EasyTag code (200 tags), {left.get('season', 0)} left</option>
+            <option value="trial">Trial code (10 tags), {left.get('trial', 0)} left</option>
+          </select>
+          <label>Who is it for? (note)</label>
+          <input name="note" placeholder="e.g. Brittany, thank-you" required>
+          <label>Their email (optional)</label>
+          <input name="email" type="email" placeholder="Leave blank to just show the code">
+          <p class="muted">If you fill in an email, they get the same code email a Square buyer gets.</p>
+          <button type="submit">Get code</button>
+        </form>""")
+
+
+@app.post("/admin/give-code")
+async def admin_give_code(request: Request):
+    from urllib.parse import parse_qs
+    form = {k: v[0].strip() for k, v in parse_qs((await request.body()).decode("utf-8")).items()}
+    require_admin(request, form_key=form.get("key"))
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
+    code_type = form.get("type") if form.get("type") in ("trial", "season") else "season"
+    note = form.get("note", "")[:200]
+    email = form.get("email", "")[:200]
+    key = html_lib.escape(form.get("key", ""))
+    again = f'<p><a href="/admin/give-code?key={key}">Give out another code</a></p>'
+
+    code = take_code_by_hand(code_type, note, email)
+    if not code:
+        return _admin_page("Out of codes",
+            f"<h2 class='err'>No {CODE_LABELS[code_type]}s left</h2>"
+            "<p>Add more codes to main.py and redeploy.</p>" + again)
+
+    sent = ""
+    if email:
+        subject, html_body, text_body = build_code_email([(code, code_type)])
+        try:
+            await send_email(email, subject, html_body, text_body,
+                             idempotency_key=f"easytag-manual-{code}")
+            sent = f"<p>✓ Emailed to <b>{html_lib.escape(email)}</b>.</p>"
+        except Exception as e:
+            print(f"!! Manual code email failed: {e}")
+            sent = (f"<p class='err'>The email to {html_lib.escape(email)} didn't go through. "
+                    "The code is still reserved for them; send it yourself.</p>")
+
+    uses = ACCESS_CODES.get(code, {}).get("total_uses", 0)
+    return _admin_page("Code ready", f"""
+        <h2>{CODE_LABELS[code_type]} ({uses} tags)</h2>
+        <div class="code">{html_lib.escape(code)}</div>
+        <p class="muted">For: {html_lib.escape(note) or '(no note)'}. This code is now marked as given out
+        and will never be sold through Square.</p>
+        {sent}{again}""")
+
+
+@app.get("/admin/retry-payment")
+async def admin_retry_payment(request: Request, payment_id: str,
+                              email: Optional[str] = None, resend: bool = False):
+    """
+    Re-run delivery for one Square payment, e.g. after an "out of codes" or
+    "no email" alert. Never assigns a second set of codes to the same payment.
+      /admin/retry-payment?payment_id=XXXX&key=YOUR_ADMIN_KEY
+      add &email=buyer@example.com to send to a specific address
+      add &resend=true to send the same codes again
+    """
+    require_admin(request)
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+    data = await square_get(f"/v2/payments/{payment_id.strip()}")
+    payment = (data or {}).get("payment")
+    if not payment:
+        raise HTTPException(status_code=404, detail="Square payment not found.")
+    try:
+        return await fulfill_payment(payment, email_override=email,
+                                     force_resend=resend or bool(email))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Delivery failed: {e}")
 
 
 
